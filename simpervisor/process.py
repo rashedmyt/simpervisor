@@ -19,6 +19,78 @@ class KilledProcessError(Exception):
     """
 
 
+class Process:
+    """
+    Abstract class to start, wait and send signals to running processes in a os agnostic way
+    """
+
+    def __init__(self, *cmd, **kwargs):
+        """
+        All info required to start the process.
+        """
+        self.proc_cmd = cmd
+        self.proc_args = kwargs
+        self.proc = None
+
+    async def start(self):
+        """
+        Start the process
+        """
+        raise NotImplementedError
+
+    async def wait(self):
+        """
+        Wait for the process to stop and return the process exit code.
+        """
+        raise NotImplementedError
+
+    def send_signal(self, signum):
+        """
+        Send the OS signal to the process.
+        """
+        if self.proc:
+            self.proc.send_signal(signum)
+
+    @property
+    def pid(self):
+        if self.proc:
+            return self.proc.pid
+
+    @property
+    def returncode(self):
+        if self.proc:
+            return self.proc.returncode
+
+
+class POSIXProcess(Process):
+    """
+    A process that uses asyncio-subprocess API to start and wait.
+    """
+
+    async def start(self):
+        self.proc = await asyncio.create_subprocess_exec(
+            *self.proc_cmd, **self.proc_args
+        )
+
+    async def wait(self):
+        return await self.proc.wait()
+
+
+class WindowsProcess(Process):
+    """
+    A process that uses subprocess API to start and wait. Waiting for the process
+    to terminate uses busy polling with sleep to provide async API
+    """
+
+    async def start(self):
+        self.proc = subprocess.Popen(list(self.proc_cmd), **self.proc_args)
+
+    async def wait(self):
+        while self.proc.poll() is None:
+            await asyncio.sleep(0.1)
+        return self.proc.wait()
+
+
 class SupervisedProcess:
     def __init__(
         self,
@@ -102,7 +174,11 @@ class SupervisedProcess:
                     f"Process {self.name} has already been explicitly killed"
                 )
             self._debug_log("try-start", "Trying to start {}", {}, self.name)
-            self.proc = subprocess.Popen(list(self._proc_args), **self._proc_kwargs)
+            if sys.platform == "win32":
+                self.proc = WindowsProcess(*self._proc_args, **self._proc_kwargs)
+            else:
+                self.proc = POSIXProcess(*self._proc_args, **self._proc_kwargs)
+            await self.proc.start()
             self._debug_log("started", "Started {}", {}, self.name)
 
             self._killed = False
@@ -124,12 +200,7 @@ class SupervisedProcess:
         This is a long running task that keeps running until the process
         exits. If we restart the process, `start()` sets this up again.
         """
-        # Since self.proc is a subprocess.Popen object, wait() method is a blocking
-        # call. To prevent the entire program being stuck at this point, we use
-        # the poll() method to check whether the child process is alive or not.
-        while self.proc.poll() is None:
-            await asyncio.sleep(0.1)
-        retcode = self.proc.wait()
+        retcode = await self.proc.wait()
         # FIXME: Do we need to aquire a lock somewhere in this method?
         remove_handler(self._handle_signal)
         self._debug_log(
@@ -160,9 +231,7 @@ class SupervisedProcess:
             # We cancel the restart watcher & wait for the process to finish,
             # since we return only after the process has been reaped
             self._restart_process_future.cancel()
-            while self.proc.poll() is None:
-                await asyncio.sleep(0.1)
-            self.proc.wait()
+            await self.proc.wait()
             self.running = False
             # Remove signal handler *after* the process is done
             remove_handler(self._handle_signal)
